@@ -51,6 +51,11 @@ public class PlayerData
     //how many claim blocks the player has been gifted by admins, or purchased via economy integration
     private Integer bonusClaimBlocks = null;
 
+    //Set when secondary storage was unreachable on the last load attempt.
+    //While true, getters return safe defaults (no NPE) and saves are skipped (no overwriting good DB data).
+    //Cleared automatically the next time a load succeeds.
+    boolean loadFailed = false;
+
     //what "mode" the shovel is in determines what it will do when it's used
     public ShovelMode shovelMode = ShovelMode.Basic;
 
@@ -184,6 +189,10 @@ public class PlayerData
     {
         if (this.accruedClaimBlocks == null) this.loadDataFromSecondaryStorage();
 
+        //If the load failed (DB unreachable), return a safe default so callers don't NPE.
+        //Saves are gated separately so this 0 will never be written back to storage.
+        if (this.accruedClaimBlocks == null) return 0;
+
         //update claim blocks with any he has accrued during his current play session
         if (this.newlyAccruedClaimBlocks > 0)
         {
@@ -215,6 +224,9 @@ public class PlayerData
     public int getBonusClaimBlocks()
     {
         if (this.bonusClaimBlocks == null) this.loadDataFromSecondaryStorage();
+        //If the load failed (DB unreachable), return 0 so callers don't NPE.
+        //Saves are gated separately so this 0 will never be written back to storage.
+        if (this.bonusClaimBlocks == null) return 0;
         return bonusClaimBlocks;
     }
 
@@ -227,6 +239,17 @@ public class PlayerData
     {
         //reach out to secondary storage to get any data there
         PlayerData storageData = GriefPrevention.instance.dataStore.getPlayerDataFromStorage(this.playerID);
+
+        //Why: a null return means the storage layer could not be reached (e.g. transient DB failure).
+        //Mark the load as failed so getters return safe defaults (no NPE) and saves are skipped
+        //(no overwriting the player's real DB row with those defaults). The flag will clear on
+        //the next successful load.
+        if (storageData == null)
+        {
+            this.loadFailed = true;
+            return;
+        }
+        this.loadFailed = false;
 
         if (this.accruedClaimBlocks == null)
         {

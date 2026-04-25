@@ -1008,6 +1008,16 @@ public abstract class DataStore
 
     public void asyncSavePlayerData(UUID playerID, PlayerData playerData)
     {
+        //If the most recent load from storage failed, the in-memory blocks are safe defaults (0)
+        //rather than the player's real values. Skipping the save here prevents those defaults from
+        //overwriting the correct row in storage. The next successful load will clear loadFailed
+        //and saves will resume normally.
+        if (playerData != null && playerData.loadFailed)
+        {
+            GriefPrevention.AddLogEntry("Skipping save for " + playerID + " — last load from storage failed, refusing to overwrite real data with defaults.", CustomLogEntryTypes.Debug, true);
+            return;
+        }
+
         //save everything except the ignore list
         this.overrideSavePlayerData(playerID, playerData);
 

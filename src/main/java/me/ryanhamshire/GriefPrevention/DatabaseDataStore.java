@@ -23,22 +23,31 @@ import org.bukkit.Location;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.World;
 
+import java.io.BufferedWriter;
+import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 //manages data stored in the file system
 public class DatabaseDataStore extends DataStore
@@ -96,6 +105,9 @@ public class DatabaseDataStore extends DataStore
             GriefPrevention.AddLogEntry("ERROR: Unable to connect to database.  Check your config file settings.");
             throw e2;
         }
+
+        //write a snapshot of current DB state to disk before any migrations or writes happen this run
+        this.backupDatabaseOnStartup();
 
         try (Statement statement = databaseConnection.createStatement())
         {
@@ -485,9 +497,26 @@ public class DatabaseDataStore extends DataStore
         }
     }
 
+    //Returns null if the database is unreachable or the SELECT fails.
+    //Why: returning a blank PlayerData would let the caller treat a transient DB failure as
+    //"new player with default blocks", and the next save would persist those defaults — wiping
+    //the player's real values. Returning null lets the caller leave in-memory fields untouched
+    //so the load is silently retried later, when the DB is healthy again.
     @Override
     PlayerData getPlayerDataFromStorage(UUID playerID)
     {
+        try
+        {
+            this.refreshDataConnection();
+        }
+        catch (SQLException e)
+        {
+            StringWriter errors = new StringWriter();
+            e.printStackTrace(new PrintWriter(errors));
+            GriefPrevention.AddLogEntry(playerID + " " + errors, CustomLogEntryTypes.Exception);
+            return null;
+        }
+
         PlayerData playerData = new PlayerData();
         playerData.playerID = playerID;
 
@@ -508,6 +537,7 @@ public class DatabaseDataStore extends DataStore
             StringWriter errors = new StringWriter();
             e.printStackTrace(new PrintWriter(errors));
             GriefPrevention.AddLogEntry(playerID + " " + errors, CustomLogEntryTypes.Exception);
+            return null;
         }
 
         return playerData;
@@ -525,27 +555,59 @@ public class DatabaseDataStore extends DataStore
 
     private void savePlayerData(String playerID, PlayerData playerData)
     {
-        try (PreparedStatement deleteStmnt = this.databaseConnection.prepareStatement(SQL_DELETE_PLAYER_DATA);
-             PreparedStatement insertStmnt = this.databaseConnection.prepareStatement(SQL_INSERT_PLAYER_DATA))
+        try
         {
-            OfflinePlayer player = Bukkit.getOfflinePlayer(UUID.fromString(playerID));
-
-            SimpleDateFormat sqlFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-            String dateString = sqlFormat.format(new Date(player.getLastPlayed()));
-            deleteStmnt.setString(1, playerID);
-            deleteStmnt.executeUpdate();
-
-            insertStmnt.setString(1, playerID);
-            insertStmnt.setString(2, dateString);
-            insertStmnt.setInt(3, playerData.getAccruedClaimBlocks());
-            insertStmnt.setInt(4, playerData.getBonusClaimBlocks());
-            insertStmnt.executeUpdate();
+            this.refreshDataConnection();
         }
         catch (SQLException e)
         {
             StringWriter errors = new StringWriter();
             e.printStackTrace(new PrintWriter(errors));
             GriefPrevention.AddLogEntry(playerID + " " + errors, CustomLogEntryTypes.Exception);
+            return;
+        }
+
+        //Why: DELETE+INSERT must be atomic. With autocommit, a connection drop between the
+        //two statements would leave the row deleted and the player's blocks wiped on next read.
+        boolean priorAutoCommit = true;
+        try
+        {
+            priorAutoCommit = this.databaseConnection.getAutoCommit();
+            this.databaseConnection.setAutoCommit(false);
+
+            try (PreparedStatement deleteStmnt = this.databaseConnection.prepareStatement(SQL_DELETE_PLAYER_DATA);
+                 PreparedStatement insertStmnt = this.databaseConnection.prepareStatement(SQL_INSERT_PLAYER_DATA))
+            {
+                OfflinePlayer player = Bukkit.getOfflinePlayer(UUID.fromString(playerID));
+
+                SimpleDateFormat sqlFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                String dateString = sqlFormat.format(new Date(player.getLastPlayed()));
+                deleteStmnt.setString(1, playerID);
+                deleteStmnt.executeUpdate();
+
+                insertStmnt.setString(1, playerID);
+                insertStmnt.setString(2, dateString);
+                insertStmnt.setInt(3, playerData.getAccruedClaimBlocks());
+                insertStmnt.setInt(4, playerData.getBonusClaimBlocks());
+                insertStmnt.executeUpdate();
+
+                this.databaseConnection.commit();
+            }
+            catch (SQLException e)
+            {
+                try { this.databaseConnection.rollback(); } catch (SQLException ignored) {}
+                throw e;
+            }
+        }
+        catch (SQLException e)
+        {
+            StringWriter errors = new StringWriter();
+            e.printStackTrace(new PrintWriter(errors));
+            GriefPrevention.AddLogEntry(playerID + " " + errors, CustomLogEntryTypes.Exception);
+        }
+        finally
+        {
+            try { this.databaseConnection.setAutoCommit(priorAutoCommit); } catch (SQLException ignored) {}
         }
     }
 
@@ -560,17 +622,45 @@ public class DatabaseDataStore extends DataStore
     {
         this.nextClaimID = nextID;
 
-        try (PreparedStatement deleteStmnt = this.databaseConnection.prepareStatement(SQL_DELETE_NEXT_CLAIM_ID);
-             PreparedStatement insertStmnt = this.databaseConnection.prepareStatement(SQL_SET_NEXT_CLAIM_ID))
+        try
         {
-            deleteStmnt.execute();
-            insertStmnt.setLong(1, nextID);
-            insertStmnt.executeUpdate();
+            this.refreshDataConnection();
         }
         catch (SQLException e)
         {
             GriefPrevention.AddLogEntry("Unable to set next claim ID to " + nextID + ".  Details:");
             GriefPrevention.AddLogEntry(e.getMessage());
+            return;
+        }
+
+        boolean priorAutoCommit = true;
+        try
+        {
+            priorAutoCommit = this.databaseConnection.getAutoCommit();
+            this.databaseConnection.setAutoCommit(false);
+
+            try (PreparedStatement deleteStmnt = this.databaseConnection.prepareStatement(SQL_DELETE_NEXT_CLAIM_ID);
+                 PreparedStatement insertStmnt = this.databaseConnection.prepareStatement(SQL_SET_NEXT_CLAIM_ID))
+            {
+                deleteStmnt.execute();
+                insertStmnt.setLong(1, nextID);
+                insertStmnt.executeUpdate();
+                this.databaseConnection.commit();
+            }
+            catch (SQLException e)
+            {
+                try { this.databaseConnection.rollback(); } catch (SQLException ignored) {}
+                throw e;
+            }
+        }
+        catch (SQLException e)
+        {
+            GriefPrevention.AddLogEntry("Unable to set next claim ID to " + nextID + ".  Details:");
+            GriefPrevention.AddLogEntry(e.getMessage());
+        }
+        finally
+        {
+            try { this.databaseConnection.setAutoCommit(priorAutoCommit); } catch (SQLException ignored) {}
         }
     }
 
@@ -578,25 +668,53 @@ public class DatabaseDataStore extends DataStore
     @Override
     synchronized void saveGroupBonusBlocks(String groupName, int currentValue)
     {
-        //group bonus blocks are stored in the player data table, with player name = $groupName
-        try (PreparedStatement deleteStmnt = this.databaseConnection.prepareStatement(SQL_DELETE_GROUP_DATA);
-             PreparedStatement insertStmnt = this.databaseConnection.prepareStatement(SQL_INSERT_PLAYER_DATA))
+        try
         {
-            SimpleDateFormat sqlFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
-            String dateString = sqlFormat.format(new Date());
-            deleteStmnt.setString(1, '$' + groupName);
-            deleteStmnt.executeUpdate();
-
-            insertStmnt.setString(1, '$' + groupName);
-            insertStmnt.setString(2, dateString);
-            insertStmnt.setInt(3, 0);
-            insertStmnt.setInt(4, currentValue);
-            insertStmnt.executeUpdate();
+            this.refreshDataConnection();
         }
         catch (SQLException e)
         {
             GriefPrevention.AddLogEntry("Unable to save data for group " + groupName + ".  Details:");
             GriefPrevention.AddLogEntry(e.getMessage());
+            return;
+        }
+
+        //group bonus blocks are stored in the player data table, with player name = $groupName
+        boolean priorAutoCommit = true;
+        try
+        {
+            priorAutoCommit = this.databaseConnection.getAutoCommit();
+            this.databaseConnection.setAutoCommit(false);
+
+            try (PreparedStatement deleteStmnt = this.databaseConnection.prepareStatement(SQL_DELETE_GROUP_DATA);
+                 PreparedStatement insertStmnt = this.databaseConnection.prepareStatement(SQL_INSERT_PLAYER_DATA))
+            {
+                SimpleDateFormat sqlFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                String dateString = sqlFormat.format(new Date());
+                deleteStmnt.setString(1, '$' + groupName);
+                deleteStmnt.executeUpdate();
+
+                insertStmnt.setString(1, '$' + groupName);
+                insertStmnt.setString(2, dateString);
+                insertStmnt.setInt(3, 0);
+                insertStmnt.setInt(4, currentValue);
+                insertStmnt.executeUpdate();
+                this.databaseConnection.commit();
+            }
+            catch (SQLException e)
+            {
+                try { this.databaseConnection.rollback(); } catch (SQLException ignored) {}
+                throw e;
+            }
+        }
+        catch (SQLException e)
+        {
+            GriefPrevention.AddLogEntry("Unable to save data for group " + groupName + ".  Details:");
+            GriefPrevention.AddLogEntry(e.getMessage());
+        }
+        finally
+        {
+            try { this.databaseConnection.setAutoCommit(priorAutoCommit); } catch (SQLException ignored) {}
         }
     }
 
@@ -682,6 +800,123 @@ public class DatabaseDataStore extends DataStore
         {
             GriefPrevention.AddLogEntry("Unable to set next schema version to " + versionToSet + ".  Details:");
             GriefPrevention.AddLogEntry(e.getMessage());
+        }
+    }
+
+    private static final String[] BACKUP_TABLES = {
+            "griefprevention_nextclaimid",
+            "griefprevention_schemaversion",
+            "griefprevention_claimdata",
+            "griefprevention_playerdata"
+    };
+
+    private static final int BACKUP_RETENTION_COUNT = 10;
+
+    //Writes a SQL dump of the four GriefPrevention tables to plugins/GriefPreventionData/backups/.
+    //Best-effort: failures are logged but do not stop plugin startup.
+    void backupDatabaseOnStartup()
+    {
+        try
+        {
+            this.refreshDataConnection();
+
+            Path backupDir = Paths.get(DataStore.dataLayerFolderPath, "backups");
+            Files.createDirectories(backupDir);
+
+            String timestamp = new SimpleDateFormat("yyyyMMdd-HHmmss").format(new Date());
+            Path backupFile = backupDir.resolve("griefprevention-backup-" + timestamp + ".sql");
+
+            try (BufferedWriter writer = Files.newBufferedWriter(backupFile, StandardCharsets.UTF_8))
+            {
+                writer.write("-- GriefPrevention database backup\n");
+                writer.write("-- Created: " + new Date() + "\n\n");
+
+                for (String table : BACKUP_TABLES)
+                {
+                    dumpTable(writer, table);
+                }
+            }
+
+            GriefPrevention.AddLogEntry("Database backup written to " + backupFile.toAbsolutePath());
+
+            pruneOldBackups(backupDir);
+        }
+        catch (SQLException | IOException e)
+        {
+            GriefPrevention.AddLogEntry("Unable to create database backup on startup.  Details: " + e.getMessage());
+        }
+    }
+
+    private void dumpTable(BufferedWriter writer, String tableName) throws SQLException, IOException
+    {
+        writer.write("-- Table: " + tableName + "\n");
+        try (Statement stmt = this.databaseConnection.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT * FROM " + tableName))
+        {
+            ResultSetMetaData meta = rs.getMetaData();
+            int columnCount = meta.getColumnCount();
+
+            StringBuilder columns = new StringBuilder();
+            for (int i = 1; i <= columnCount; i++)
+            {
+                if (i > 1) columns.append(", ");
+                columns.append(meta.getColumnName(i));
+            }
+
+            int rowCount = 0;
+            while (rs.next())
+            {
+                writer.write("INSERT INTO " + tableName + " (" + columns + ") VALUES (");
+                for (int i = 1; i <= columnCount; i++)
+                {
+                    if (i > 1) writer.write(", ");
+                    Object value = rs.getObject(i);
+                    if (value == null)
+                    {
+                        writer.write("NULL");
+                    }
+                    else if (value instanceof Number || value instanceof Boolean)
+                    {
+                        writer.write(value.toString());
+                    }
+                    else
+                    {
+                        writer.write("'" + value.toString().replace("'", "''") + "'");
+                    }
+                }
+                writer.write(");\n");
+                rowCount++;
+            }
+            writer.write("-- " + rowCount + " row(s)\n\n");
+        }
+        catch (SQLException e)
+        {
+            //Why: missing tables are non-fatal — a fresh install may not have all of them yet.
+            writer.write("-- Skipped (could not read): " + e.getMessage() + "\n\n");
+        }
+    }
+
+    private void pruneOldBackups(Path backupDir)
+    {
+        try (Stream<Path> entries = Files.list(backupDir))
+        {
+            List<Path> backups = new ArrayList<>();
+            entries.filter(p -> p.getFileName().toString().startsWith("griefprevention-backup-")
+                    && p.getFileName().toString().endsWith(".sql"))
+                    .forEach(backups::add);
+
+            backups.sort(Comparator.comparing(p -> p.getFileName().toString()));
+
+            int toDelete = backups.size() - BACKUP_RETENTION_COUNT;
+            for (int i = 0; i < toDelete; i++)
+            {
+                try { Files.deleteIfExists(backups.get(i)); }
+                catch (IOException ignored) {}
+            }
+        }
+        catch (IOException e)
+        {
+            GriefPrevention.AddLogEntry("Unable to prune old database backups.  Details: " + e.getMessage());
         }
     }
 

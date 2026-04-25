@@ -40,6 +40,12 @@ class CleanupUnusedClaimPreTask implements Runnable
     {
         //get the data
         PlayerData ownerData = GriefPrevention.instance.dataStore.getPlayerDataFromStorage(ownerID);
+        //if storage is unavailable, skip this owner — better to defer cleanup than to expire claims based on missing data
+        if (ownerData == null)
+        {
+            GriefPrevention.AddLogEntry("Could not load player data for " + ownerID + ", skipping cleanup check this pass.", CustomLogEntryTypes.Debug, true);
+            return;
+        }
         OfflinePlayer ownerInfo = Bukkit.getServer().getOfflinePlayer(ownerID);
 
         GriefPrevention.AddLogEntry("Looking for expired claims.  Checking data for " + ownerID.toString(), CustomLogEntryTypes.Debug, true);
